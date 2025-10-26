@@ -1,0 +1,592 @@
+"""
+Local Attribution Map (LAM) Visualization Module for Super-Resolution Networks
+
+This module implements comprehensive LAM generation and visualization techniques
+for analyzing and interpreting super-resolution deep neural networks. It provides
+tools to understand which input regions contribute most to output predictions.
+
+Author: jerrychen
+Date: 2025
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+import cv2
+from typing import Tuple, List, Dict, Optional, Union
+import os
+from pathlib import Path
+from scipy.ndimage import gaussian_filter
+import seaborn as sns
+from matplotlib.colors import LinearSegmentedColormap
+import warnings
+warnings.filterwarnings('ignore')
+
+
+class SRResidualBlock(nn.Module):
+    """
+    Residual block for super-resolution network.
+    
+    This block implements a standard residual connection with two convolutional
+    layers and ReLU activation, commonly used in SR networks like EDSR and SRResNet.
+    """
+    
+    def __init__(self, channels: int = 64, kernel_size: int = 3):
+        """
+        Initialize the residual block.
+        
+        Args:
+            channels: Number of feature channels
+            kernel_size: Size of convolutional kernel
+        """
+        super(SRResidualBlock, self).__init__()
+        
+        padding = kernel_size // 2
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size, padding=padding)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size, padding=padding)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through residual block.
+        
+        Args:
+            x: Input tensor of shape (B, C, H, W)
+            
+        Returns:
+            Output tensor with residual connection
+        """
+        residual = x
+        out = self.conv1(x)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out += residual
+        return out
+
+
+class SimpleSRNetwork(nn.Module):
+    """
+    Simplified Super-Resolution Network for demonstration.
+    
+    This network implements a basic SR architecture with residual blocks
+    and sub-pixel convolution for upsampling. It serves as a test model
+    for LAM visualization techniques.
+    """
+    
+    def __init__(self, scale_factor: int = 2, num_channels: int = 3, 
+                 num_features: int = 64, num_blocks: int = 8):
+        """
+        Initialize the SR network.
+        
+        Args:
+            scale_factor: Upsampling scale factor (2, 3, or 4)
+            num_channels: Number of input/output image channels
+            num_features: Number of feature channels in residual blocks
+            num_blocks: Number of residual blocks
+        """
+        super(SimpleSRNetwork, self).__init__()
+        
+        self.scale_factor = scale_factor
+        
+        # Initial feature extraction
+        self.conv_first = nn.Conv2d(num_channels, num_features, 3, padding=1)
+        
+        # Residual blocks for feature processing
+        self.res_blocks = nn.ModuleList([
+            SRResidualBlock(num_features) for _ in range(num_blocks)
+        ])
+        
+        # Middle convolution
+        self.conv_mid = nn.Conv2d(num_features, num_features, 3, padding=1)
+        
+        # Upsampling layers
+        self.upsampling = nn.Sequential(
+            nn.Conv2d(num_features, num_features * (scale_factor ** 2), 3, padding=1),
+            nn.PixelShuffle(scale_factor)
+        )
+        
+        # Final reconstruction
+        self.conv_last = nn.Conv2d(num_features, num_channels, 3, padding=1)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through the SR network.
+        
+        Args:
+            x: Low-resolution input tensor (B, C, H, W)
+            
+        Returns:
+            High-resolution output tensor (B, C, H*scale, W*scale)
+        """
+        # Feature extraction
+        feat = self.conv_first(x)
+        residual = feat
+        
+        # Residual blocks processing
+        for block in self.res_blocks:
+            feat = block(feat)
+        
+        # Middle convolution with global residual
+        feat = self.conv_mid(feat)
+        feat += residual
+        
+        # Upsampling
+        feat = self.upsampling(feat)
+        
+        # Final reconstruction
+        output = self.conv_last(feat)
+        
+        return output
+
+
+class LAMGenerator:
+    """
+    Local Attribution Map Generator for Super-Resolution Networks.
+    
+    This class implements various LAM generation techniques to analyze
+    which parts of the input image contribute to specific output regions
+    in super-resolution networks.
+    """
+    
+    def __init__(self, model: nn.Module, device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
+        """
+        Initialize LAM generator.
+        
+        Args:
+            model: The super-resolution model to analyze
+            device: Computing device ('cuda' or 'cpu')
+        """
+        self.model = model.to(device)
+        self.model.eval()
+        self.device = device
+        
+    def generate_sliding_window_lam(self, 
+                                    lr_image: torch.Tensor,
+                                    window_size: int = 8,
+                                    stride: int = 4,
+                                    target_position: Optional[Tuple[int, int]] = None) -> np.ndarray:
+        """
+        Generate LAM using sliding window occlusion method.
+        
+        This method systematically occludes different regions of the input
+        and measures the impact on the output at a target position.
+        
+        Args:
+            lr_image: Low-resolution input image (1, C, H, W)
+            window_size: Size of the occlusion window
+            stride: Stride for sliding the window
+            target_position: Target position in HR image to analyze (y, x)
+                           If None, analyzes the center position
+            
+        Returns:
+            Attribution map as numpy array (H, W)
+        """
+        _, _, h, w = lr_image.shape
+        scale = self.model.scale_factor
+        
+        # Get baseline output
+        with torch.no_grad():
+            baseline_output = self.model(lr_image)
+        
+        # Determine target position
+        if target_position is None:
+            target_position = (baseline_output.shape[2] // 2, baseline_output.shape[3] // 2)
+        
+        # Initialize attribution map
+        attribution_map = np.zeros((h, w))
+        count_map = np.zeros((h, w))
+        
+        # Slide window across the image
+        for y in range(0, h - window_size + 1, stride):
+            for x in range(0, w - window_size + 1, stride):
+                # Create occluded image
+                occluded_image = lr_image.clone()
+                occluded_image[:, :, y:y+window_size, x:x+window_size] = 0
+                
+                # Get output with occlusion
+                with torch.no_grad():
+                    occluded_output = self.model(occluded_image)
+                
+                # Calculate difference at target position
+                diff = torch.abs(baseline_output[:, :, target_position[0], target_position[1]] - 
+                               occluded_output[:, :, target_position[0], target_position[1]])
+                importance = diff.mean().cpu().numpy()
+                
+                # Accumulate attribution
+                attribution_map[y:y+window_size, x:x+window_size] += importance
+                count_map[y:y+window_size, x:x+window_size] += 1
+        
+        # Normalize by count
+        attribution_map = np.divide(attribution_map, count_map, 
+                                   where=count_map>0, out=np.zeros_like(attribution_map))
+        
+        return attribution_map
+    
+    def generate_gradient_based_lam(self,
+                                    lr_image: torch.Tensor,
+                                    target_position: Optional[Tuple[int, int]] = None) -> np.ndarray:
+        """
+        Generate LAM using gradient-based attribution.
+        
+        This method computes gradients of the output with respect to input
+        to determine input importance.
+        
+        Args:
+            lr_image: Low-resolution input image (1, C, H, W)
+            target_position: Target position in HR image (y, x)
+            
+        Returns:
+            Attribution map as numpy array (H, W)
+        """
+        lr_image = lr_image.requires_grad_(True)
+        
+        # Forward pass
+        output = self.model(lr_image)
+        
+        # Determine target position
+        if target_position is None:
+            target_position = (output.shape[2] // 2, output.shape[3] // 2)
+        
+        # Select target output value
+        target_value = output[:, :, target_position[0], target_position[1]].sum()
+        
+        # Backward pass
+        self.model.zero_grad()
+        target_value.backward()
+        
+        # Get gradients
+        gradients = lr_image.grad.abs().mean(dim=1).squeeze().cpu().numpy()
+        
+        return gradients
+    
+    def generate_integrated_gradients_lam(self,
+                                         lr_image: torch.Tensor,
+                                         target_position: Optional[Tuple[int, int]] = None,
+                                         steps: int = 50) -> np.ndarray:
+        """
+        Generate LAM using Integrated Gradients method.
+        
+        Integrated Gradients accumulates gradients along a path from a baseline
+        to the input image, providing more stable attribution.
+        
+        Args:
+            lr_image: Low-resolution input image (1, C, H, W)
+            target_position: Target position in HR image (y, x)
+            steps: Number of integration steps
+            
+        Returns:
+            Attribution map as numpy array (H, W)
+        """
+        # Create baseline (black image)
+        baseline = torch.zeros_like(lr_image)
+        
+        # Generate interpolated images
+        alphas = torch.linspace(0, 1, steps).to(self.device)
+        integrated_gradients = torch.zeros_like(lr_image)
+        
+        for alpha in alphas:
+            # Interpolate between baseline and input
+            interpolated = baseline + alpha * (lr_image - baseline)
+            interpolated = interpolated.requires_grad_(True)
+            
+            # Forward pass
+            output = self.model(interpolated)
+            
+            # Determine target position
+            if target_position is None:
+                target_position = (output.shape[2] // 2, output.shape[3] // 2)
+            
+            # Select target output
+            target_value = output[:, :, target_position[0], target_position[1]].sum()
+            
+            # Backward pass
+            self.model.zero_grad()
+            target_value.backward()
+            
+            # Accumulate gradients
+            integrated_gradients += interpolated.grad
+        
+        # Average gradients and scale by input difference
+        integrated_gradients = integrated_gradients / steps
+        attribution = (lr_image - baseline) * integrated_gradients
+        attribution_map = attribution.abs().mean(dim=1).squeeze().cpu().detach().numpy()
+        
+        return attribution_map
+
+
+class LAMVisualizer:
+    """
+    Visualization tools for Local Attribution Maps.
+    
+    This class provides various visualization methods to display and analyze
+    LAMs in an intuitive and informative manner.
+    """
+    
+    def __init__(self, output_dir: str = './lam_visualizations'):
+        """
+        Initialize LAM visualizer.
+        
+        Args:
+            output_dir: Directory to save visualization outputs
+        """
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create custom colormap for heatmaps
+        self.heatmap_cmap = LinearSegmentedColormap.from_list(
+            'custom_heatmap', 
+            ['blue', 'cyan', 'yellow', 'red']
+        )
+    
+    def visualize_lam_overlay(self,
+                             original_image: np.ndarray,
+                             attribution_map: np.ndarray,
+                             alpha: float = 0.6,
+                             save_path: Optional[str] = None) -> np.ndarray:
+        """
+        Visualize LAM as overlay on original image.
+        
+        Args:
+            original_image: Original LR image (H, W, C) in range [0, 255]
+            attribution_map: Attribution map (H, W)
+            alpha: Transparency of overlay
+            save_path: Path to save the visualization
+            
+        Returns:
+            Visualization as numpy array
+        """
+        # Normalize attribution map
+        attr_norm = (attribution_map - attribution_map.min()) / (attribution_map.max() - attribution_map.min() + 1e-8)
+        
+        # Resize attribution map to match image size if needed
+        if attr_norm.shape != original_image.shape[:2]:
+            attr_norm = cv2.resize(attr_norm, (original_image.shape[1], original_image.shape[0]))
+        
+        # Create heatmap
+        heatmap = plt.cm.jet(attr_norm)[:, :, :3] * 255
+        
+        # Ensure original image is in correct format
+        if original_image.max() <= 1.0:
+            original_image = (original_image * 255).astype(np.uint8)
+        
+        # Overlay heatmap on original image
+        overlay = cv2.addWeighted(original_image.astype(np.uint8), 1-alpha, 
+                                 heatmap.astype(np.uint8), alpha, 0)
+        
+        if save_path:
+            cv2.imwrite(save_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+        
+        return overlay
+    
+    def create_comprehensive_visualization(self,
+                                          lr_image: np.ndarray,
+                                          hr_image: np.ndarray,
+                                          lam_dict: Dict[str, np.ndarray],
+                                          save_path: Optional[str] = None):
+        """
+        Create comprehensive multi-panel LAM visualization.
+        
+        Args:
+            lr_image: Low-resolution image (H, W, C)
+            hr_image: High-resolution image (H', W', C)
+            lam_dict: Dictionary of LAMs with method names as keys
+            save_path: Path to save the figure
+        """
+        num_methods = len(lam_dict)
+        fig, axes = plt.subplots(2, num_methods + 1, figsize=(5*(num_methods+1), 10))
+        
+        # Convert images to RGB if needed
+        if lr_image.max() <= 1.0:
+            lr_image = (lr_image * 255).astype(np.uint8)
+        if hr_image.max() <= 1.0:
+            hr_image = (hr_image * 255).astype(np.uint8)
+        
+        # Plot LR image
+        axes[0, 0].imshow(lr_image)
+        axes[0, 0].set_title('Low-Resolution Input', fontsize=12, fontweight='bold')
+        axes[0, 0].axis('off')
+        
+        # Plot HR image
+        axes[1, 0].imshow(hr_image)
+        axes[1, 0].set_title('High-Resolution Output', fontsize=12, fontweight='bold')
+        axes[1, 0].axis('off')
+        
+        # Plot each LAM method
+        for idx, (method_name, lam) in enumerate(lam_dict.items(), 1):
+            # Normalize LAM
+            lam_norm = (lam - lam.min()) / (lam.max() - lam.min() + 1e-8)
+            
+            # Plot raw heatmap
+            im1 = axes[0, idx].imshow(lam_norm, cmap=self.heatmap_cmap)
+            axes[0, idx].set_title(f'{method_name}\n(Heatmap)', fontsize=12, fontweight='bold')
+            axes[0, idx].axis('off')
+            plt.colorbar(im1, ax=axes[0, idx], fraction=0.046)
+            
+            # Plot overlay
+            overlay = self.visualize_lam_overlay(lr_image.copy(), lam, alpha=0.5)
+            axes[1, idx].imshow(overlay)
+            axes[1, idx].set_title(f'{method_name}\n(Overlay)', fontsize=12, fontweight='bold')
+            axes[1, idx].axis('off')
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Comprehensive visualization saved to: {save_path}")
+        
+        plt.show()
+        
+    def plot_lam_statistics(self,
+                           lam_dict: Dict[str, np.ndarray],
+                           save_path: Optional[str] = None):
+        """
+        Plot statistical analysis of different LAM methods.
+        
+        Args:
+            lam_dict: Dictionary of LAMs from different methods
+            save_path: Path to save the figure
+        """
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        
+        # 1. Distribution comparison
+        for method_name, lam in lam_dict.items():
+            axes[0, 0].hist(lam.flatten(), bins=50, alpha=0.5, label=method_name)
+        axes[0, 0].set_xlabel('Attribution Value', fontsize=11)
+        axes[0, 0].set_ylabel('Frequency', fontsize=11)
+        axes[0, 0].set_title('Attribution Value Distributions', fontsize=12, fontweight='bold')
+        axes[0, 0].legend()
+        axes[0, 0].grid(alpha=0.3)
+        
+        # 2. Mean attribution by method
+        method_names = list(lam_dict.keys())
+        mean_attrs = [lam.mean() for lam in lam_dict.values()]
+        axes[0, 1].bar(method_names, mean_attrs, color='steelblue', alpha=0.7)
+        axes[0, 1].set_ylabel('Mean Attribution', fontsize=11)
+        axes[0, 1].set_title('Average Attribution by Method', fontsize=12, fontweight='bold')
+        axes[0, 1].tick_params(axis='x', rotation=45)
+        axes[0, 1].grid(axis='y', alpha=0.3)
+        
+        # 3. Sparsity analysis
+        sparsity_thresholds = np.linspace(0, 1, 20)
+        for method_name, lam in lam_dict.items():
+            lam_norm = (lam - lam.min()) / (lam.max() - lam.min() + 1e-8)
+            sparsity = [np.mean(lam_norm > thresh) for thresh in sparsity_thresholds]
+            axes[1, 0].plot(sparsity_thresholds, sparsity, marker='o', label=method_name, markersize=4)
+        axes[1, 0].set_xlabel('Threshold', fontsize=11)
+        axes[1, 0].set_ylabel('Proportion Above Threshold', fontsize=11)
+        axes[1, 0].set_title('Sparsity Analysis', fontsize=12, fontweight='bold')
+        axes[1, 0].legend()
+        axes[1, 0].grid(alpha=0.3)
+        
+        # 4. Correlation heatmap between methods
+        if len(lam_dict) > 1:
+            correlation_matrix = np.zeros((len(lam_dict), len(lam_dict)))
+            for i, (name1, lam1) in enumerate(lam_dict.items()):
+                for j, (name2, lam2) in enumerate(lam_dict.items()):
+                    correlation_matrix[i, j] = np.corrcoef(lam1.flatten(), lam2.flatten())[0, 1]
+            
+            sns.heatmap(correlation_matrix, annot=True, fmt='.3f', 
+                       xticklabels=method_names, yticklabels=method_names,
+                       cmap='coolwarm', center=0, ax=axes[1, 1], vmin=-1, vmax=1)
+            axes[1, 1].set_title('Inter-method Correlation', fontsize=12, fontweight='bold')
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Statistical analysis saved to: {save_path}")
+        
+        plt.show()
+
+
+def demo_lam_pipeline():
+    """
+    Demonstration pipeline for LAM generation and visualization.
+    
+    This function demonstrates the complete workflow of:
+    1. Creating a super-resolution network
+    2. Generating LAMs using different methods
+    3. Visualizing and analyzing the results
+    """
+    print("="*70)
+    print("LAM Visualization Module Demo")
+    print("="*70)
+    
+    # Setup device
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"\nUsing device: {device}")
+    
+    # Create a simple SR network
+    print("\n[1/5] Creating Super-Resolution Network...")
+    model = SimpleSRNetwork(scale_factor=2, num_channels=3, num_features=64, num_blocks=4)
+    model.to(device)
+    print(f"Network created with {sum(p.numel() for p in model.parameters())} parameters")
+    
+    # Create synthetic test image
+    print("\n[2/5] Generating synthetic test image...")
+    lr_size = 64
+    lr_image = torch.randn(1, 3, lr_size, lr_size).to(device)
+    lr_image = torch.sigmoid(lr_image)  # Normalize to [0, 1]
+    
+    # Generate HR output
+    with torch.no_grad():
+        hr_image = model(lr_image)
+    
+    print(f"LR image shape: {lr_image.shape}")
+    print(f"HR image shape: {hr_image.shape}")
+    
+    # Initialize LAM generator
+    print("\n[3/5] Generating Local Attribution Maps...")
+    lam_generator = LAMGenerator(model, device)
+    
+    # Generate LAMs using different methods
+    lam_dict = {}
+    
+    # Method 1: Sliding window
+    print("  - Generating sliding window LAM...")
+    lam_dict['Sliding Window'] = lam_generator.generate_sliding_window_lam(
+        lr_image, window_size=8, stride=4
+    )
+    
+    # Method 2: Gradient-based
+    print("  - Generating gradient-based LAM...")
+    lam_dict['Gradient'] = lam_generator.generate_gradient_based_lam(lr_image)
+    
+    # Method 3: Integrated gradients
+    print("  - Generating integrated gradients LAM...")
+    lam_dict['Integrated Gradients'] = lam_generator.generate_integrated_gradients_lam(
+        lr_image, steps=30
+    )
+    
+    # Initialize visualizer
+    print("\n[4/5] Creating visualizations...")
+    visualizer = LAMVisualizer(output_dir='./lam_results')
+    
+    # Convert tensors to numpy for visualization
+    lr_np = lr_image.squeeze().permute(1, 2, 0).cpu().numpy()
+    hr_np = hr_image.squeeze().permute(1, 2, 0).cpu().numpy()
+    
+    # Create comprehensive visualization
+    visualizer.create_comprehensive_visualization(
+        lr_np, hr_np, lam_dict,
+        save_path='./lam_results/comprehensive_lam_analysis.png'
+    )
+    
+    # Plot statistics
+    print("\n[5/5] Generating statistical analysis...")
+    visualizer.plot_lam_statistics(
+        lam_dict,
+        save_path='./lam_results/lam_statistics.png'
+    )
+    
+    print("\n" + "="*70)
+    print("Demo completed successfully!")
+    print("Results saved to: ./lam_results/")
+    print("="*70)
+
+
+if __name__ == "__main__":
+    # Run demonstration
+    demo_lam_pipeline()
