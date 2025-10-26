@@ -1,0 +1,862 @@
+"""
+Super-Resolution Network Training and Evaluation Module
+
+This module implements a complete training framework for super-resolution networks,
+including advanced architectures, training strategies, evaluation metrics, and
+detailed performance analysis for interpretability studies.
+
+Author: jerrychen
+Date: 2025
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+import numpy as np
+import cv2
+from PIL import Image
+import os
+from pathlib import Path
+from typing import Tuple, List, Dict, Optional, Union, Callable
+import matplotlib.pyplot as plt
+import time
+from tqdm import tqdm
+import json
+from dataclasses import dataclass, asdict
+import math
+
+
+@dataclass
+class TrainingConfig:
+    """
+    Configuration class for training parameters.
+    
+    This dataclass encapsulates all hyperparameters and settings
+    needed for training super-resolution networks.
+    """
+    # Model parameters
+    scale_factor: int = 2
+    num_channels: int = 3
+    num_features: int = 64
+    num_blocks: int = 16
+    
+    # Training parameters
+    batch_size: int = 16
+    num_epochs: int = 100
+    learning_rate: float = 1e-4
+    weight_decay: float = 0.0
+    
+    # Loss function weights
+    loss_type: str = 'l1'  # 'l1', 'l2', or 'mixed'
+    perceptual_weight: float = 0.0
+    adversarial_weight: float = 0.0
+    
+    # Data parameters
+    patch_size: int = 48
+    augmentation: bool = True
+    
+    # Optimization
+    optimizer_type: str = 'adam'  # 'adam', 'sgd', 'adamw'
+    scheduler_type: str = 'cosine'  # 'step', 'cosine', 'plateau'
+    
+    # Paths
+    checkpoint_dir: str = './checkpoints'
+    log_dir: str = './logs'
+    
+    def to_dict(self) -> dict:
+        """Convert config to dictionary."""
+        return asdict(self)
+
+
+class ChannelAttention(nn.Module):
+    """
+    Channel Attention Module.
+    
+    This module implements channel-wise attention mechanism to dynamically
+    adjust feature importance across channels, similar to RCAN architecture.
+    """
+    
+    def __init__(self, channels: int, reduction: int = 16):
+        """
+        Initialize channel attention.
+        
+        Args:
+            channels: Number of input channels
+            reduction: Channel reduction ratio for bottleneck
+        """
+        super(ChannelAttention, self).__init__()
+        
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1, bias=False)
+        )
+        
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply channel attention.
+        
+        Args:
+            x: Input tensor (B, C, H, W)
+            
+        Returns:
+            Attention-weighted tensor
+        """
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        attention = self.sigmoid(avg_out + max_out)
+        return x * attention
+
+
+class ResidualChannelAttentionBlock(nn.Module):
+    """
+    Residual Channel Attention Block (RCAB).
+    
+    Combines residual learning with channel attention for enhanced
+    feature representation in super-resolution tasks.
+    """
+    
+    def __init__(self, channels: int, reduction: int = 16):
+        """
+        Initialize RCAB.
+        
+        Args:
+            channels: Number of feature channels
+            reduction: Channel attention reduction ratio
+        """
+        super(ResidualChannelAttentionBlock, self).__init__()
+        
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.channel_attention = ChannelAttention(channels, reduction)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through RCAB."""
+        residual = x
+        out = self.conv1(x)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.channel_attention(out)
+        out += residual
+        return out
+
+
+class AdvancedSRNetwork(nn.Module):
+    """
+    Advanced Super-Resolution Network with Channel Attention.
+    
+    This network implements a sophisticated SR architecture with:
+    - Residual channel attention blocks
+    - Multi-level feature fusion
+    - Sub-pixel convolution for upsampling
+    """
+    
+    def __init__(self, config: TrainingConfig):
+        """
+        Initialize advanced SR network.
+        
+        Args:
+            config: Training configuration object
+        """
+        super(AdvancedSRNetwork, self).__init__()
+        
+        self.scale = config.scale_factor
+        num_channels = config.num_channels
+        num_features = config.num_features
+        num_blocks = config.num_blocks
+        
+        # Shallow feature extraction
+        self.conv_first = nn.Conv2d(num_channels, num_features, 3, padding=1)
+        
+        # Deep feature extraction with RCABs
+        self.rcab_blocks = nn.ModuleList([
+            ResidualChannelAttentionBlock(num_features) for _ in range(num_blocks)
+        ])
+        
+        # Feature fusion
+        self.conv_fusion = nn.Conv2d(num_features, num_features, 3, padding=1)
+        
+        # Upsampling module
+        if self.scale == 2 or self.scale == 3:
+            self.upsampler = nn.Sequential(
+                nn.Conv2d(num_features, num_features * (self.scale ** 2), 3, padding=1),
+                nn.PixelShuffle(self.scale)
+            )
+        elif self.scale == 4:
+            self.upsampler = nn.Sequential(
+                nn.Conv2d(num_features, num_features * 4, 3, padding=1),
+                nn.PixelShuffle(2),
+                nn.Conv2d(num_features, num_features * 4, 3, padding=1),
+                nn.PixelShuffle(2)
+            )
+        else:
+            raise ValueError(f"Unsupported scale factor: {self.scale}")
+        
+        # Final reconstruction
+        self.conv_last = nn.Conv2d(num_features, num_channels, 3, padding=1)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through the network.
+        
+        Args:
+            x: Low-resolution input (B, C, H, W)
+            
+        Returns:
+            High-resolution output (B, C, H*scale, W*scale)
+        """
+        # Shallow feature extraction
+        feat = self.conv_first(x)
+        residual = feat
+        
+        # Deep feature extraction
+        for block in self.rcab_blocks:
+            feat = block(feat)
+        
+        # Feature fusion with global residual
+        feat = self.conv_fusion(feat)
+        feat += residual
+        
+        # Upsampling
+        feat = self.upsampler(feat)
+        
+        # Reconstruction
+        output = self.conv_last(feat)
+        
+        return output
+
+
+class SyntheticSRDataset(Dataset):
+    """
+    Synthetic Dataset for Super-Resolution Training.
+    
+    Generates synthetic image pairs by downsampling high-resolution patches
+    to create low-resolution inputs. Useful for demonstration and testing.
+    """
+    
+    def __init__(self, 
+                 num_samples: int = 1000,
+                 hr_size: int = 96,
+                 scale_factor: int = 2,
+                 augmentation: bool = True):
+        """
+        Initialize synthetic dataset.
+        
+        Args:
+            num_samples: Number of synthetic samples to generate
+            hr_size: Size of high-resolution patches
+            scale_factor: Downsampling scale factor
+            augmentation: Whether to apply data augmentation
+        """
+        self.num_samples = num_samples
+        self.hr_size = hr_size
+        self.scale_factor = scale_factor
+        self.augmentation = augmentation
+        self.lr_size = hr_size // scale_factor
+    
+    def __len__(self) -> int:
+        """Return dataset size."""
+        return self.num_samples
+    
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Generate a synthetic image pair.
+        
+        Args:
+            idx: Sample index
+            
+        Returns:
+            Tuple of (LR image, HR image) as tensors
+        """
+        # Generate random HR image with structured patterns
+        hr_image = self._generate_structured_image()
+        
+        # Apply augmentation if enabled
+        if self.augmentation and np.random.rand() > 0.5:
+            hr_image = self._augment(hr_image)
+        
+        # Convert to tensor
+        hr_tensor = torch.from_numpy(hr_image).float().permute(2, 0, 1) / 255.0
+        
+        # Generate LR by downsampling
+        lr_tensor = F.interpolate(hr_tensor.unsqueeze(0), 
+                                 size=(self.lr_size, self.lr_size),
+                                 mode='bicubic',
+                                 align_corners=False).squeeze(0)
+        
+        return lr_tensor, hr_tensor
+    
+    def _generate_structured_image(self) -> np.ndarray:
+        """
+        Generate synthetic image with structured patterns.
+        
+        Returns:
+            RGB image as numpy array (H, W, C)
+        """
+        # Create base image with gradients and patterns
+        image = np.zeros((self.hr_size, self.hr_size, 3), dtype=np.float32)
+        
+        # Add gradient backgrounds
+        x = np.linspace(0, 1, self.hr_size)
+        y = np.linspace(0, 1, self.hr_size)
+        xv, yv = np.meshgrid(x, y)
+        
+        image[:, :, 0] = xv * 255
+        image[:, :, 1] = yv * 255
+        image[:, :, 2] = (1 - xv) * (1 - yv) * 255
+        
+        # Add random geometric shapes
+        num_shapes = np.random.randint(3, 8)
+        for _ in range(num_shapes):
+            shape_type = np.random.choice(['circle', 'rectangle', 'line'])
+            color = np.random.randint(0, 256, 3)
+            
+            if shape_type == 'circle':
+                center = (np.random.randint(0, self.hr_size), 
+                         np.random.randint(0, self.hr_size))
+                radius = np.random.randint(5, self.hr_size // 4)
+                cv2.circle(image, center, radius, color.tolist(), -1)
+            
+            elif shape_type == 'rectangle':
+                pt1 = (np.random.randint(0, self.hr_size), 
+                      np.random.randint(0, self.hr_size))
+                pt2 = (np.random.randint(0, self.hr_size), 
+                      np.random.randint(0, self.hr_size))
+                cv2.rectangle(image, pt1, pt2, color.tolist(), -1)
+            
+            elif shape_type == 'line':
+                pt1 = (np.random.randint(0, self.hr_size), 
+                      np.random.randint(0, self.hr_size))
+                pt2 = (np.random.randint(0, self.hr_size), 
+                      np.random.randint(0, self.hr_size))
+                thickness = np.random.randint(1, 5)
+                cv2.line(image, pt1, pt2, color.tolist(), thickness)
+        
+        # Add noise
+        noise = np.random.normal(0, 10, image.shape)
+        image = np.clip(image + noise, 0, 255)
+        
+        return image.astype(np.uint8)
+    
+    def _augment(self, image: np.ndarray) -> np.ndarray:
+        """
+        Apply random augmentation to image.
+        
+        Args:
+            image: Input image (H, W, C)
+            
+        Returns:
+            Augmented image
+        """
+        # Random horizontal flip
+        if np.random.rand() > 0.5:
+            image = np.fliplr(image)
+        
+        # Random vertical flip
+        if np.random.rand() > 0.5:
+            image = np.flipud(image)
+        
+        # Random rotation (90, 180, 270 degrees)
+        k = np.random.randint(0, 4)
+        image = np.rot90(image, k)
+        
+        return image.copy()
+
+
+class PerceptualLoss(nn.Module):
+    """
+    Perceptual Loss using VGG features.
+    
+    Computes loss in feature space of a pre-trained network
+    to capture perceptual similarity beyond pixel-wise differences.
+    """
+    
+    def __init__(self, feature_layers: List[int] = [3, 8, 15]):
+        """
+        Initialize perceptual loss.
+        
+        Args:
+            feature_layers: Indices of VGG layers to use for features
+        """
+        super(PerceptualLoss, self).__init__()
+        
+        # Note: In practice, you would load pre-trained VGG here
+        # For this demo, we'll use a placeholder network
+        self.feature_extractor = self._build_feature_extractor()
+        self.criterion = nn.L1Loss()
+    
+    def _build_feature_extractor(self) -> nn.ModuleList:
+        """Build simplified feature extractor."""
+        layers = nn.ModuleList([
+            nn.Conv2d(3, 64, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.ReLU(inplace=True)
+        ])
+        
+        # Freeze parameters
+        for param in layers.parameters():
+            param.requires_grad = False
+        
+        return layers
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Compute perceptual loss.
+        
+        Args:
+            pred: Predicted image
+            target: Target image
+            
+        Returns:
+            Perceptual loss value
+        """
+        loss = 0.0
+        pred_feat = pred
+        target_feat = target
+        
+        for layer in self.feature_extractor:
+            pred_feat = layer(pred_feat)
+            target_feat = layer(target_feat)
+            loss += self.criterion(pred_feat, target_feat)
+        
+        return loss
+
+
+class MetricsCalculator:
+    """
+    Calculate image quality metrics for super-resolution evaluation.
+    
+    Implements PSNR, SSIM, and other common metrics used in SR research.
+    """
+    
+    @staticmethod
+    def calculate_psnr(img1: torch.Tensor, img2: torch.Tensor, 
+                       max_value: float = 1.0) -> float:
+        """
+        Calculate Peak Signal-to-Noise Ratio.
+        
+        Args:
+            img1: First image tensor
+            img2: Second image tensor
+            max_value: Maximum possible pixel value
+            
+        Returns:
+            PSNR value in dB
+        """
+        mse = torch.mean((img1 - img2) ** 2)
+        if mse == 0:
+            return float('inf')
+        psnr = 20 * torch.log10(max_value / torch.sqrt(mse))
+        return psnr.item()
+    
+    @staticmethod
+    def calculate_ssim(img1: torch.Tensor, img2: torch.Tensor,
+                      window_size: int = 11, size_average: bool = True) -> float:
+        """
+        Calculate Structural Similarity Index.
+        
+        Simplified SSIM implementation for demonstration.
+        
+        Args:
+            img1: First image tensor
+            img2: Second image tensor
+            window_size: Size of gaussian window
+            size_average: Whether to average over spatial dimensions
+            
+        Returns:
+            SSIM value
+        """
+        C1 = 0.01 ** 2
+        C2 = 0.03 ** 2
+        
+        mu1 = F.avg_pool2d(img1, window_size, stride=1, padding=window_size//2)
+        mu2 = F.avg_pool2d(img2, window_size, stride=1, padding=window_size//2)
+        
+        mu1_sq = mu1.pow(2)
+        mu2_sq = mu2.pow(2)
+        mu1_mu2 = mu1 * mu2
+        
+        sigma1_sq = F.avg_pool2d(img1 * img1, window_size, stride=1, padding=window_size//2) - mu1_sq
+        sigma2_sq = F.avg_pool2d(img2 * img2, window_size, stride=1, padding=window_size//2) - mu2_sq
+        sigma12 = F.avg_pool2d(img1 * img2, window_size, stride=1, padding=window_size//2) - mu1_mu2
+        
+        ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+                   ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+        
+        if size_average:
+            return ssim_map.mean().item()
+        else:
+            return ssim_map.mean(1).mean(1).mean(1)
+
+
+class SRTrainer:
+    """
+    Trainer class for Super-Resolution Networks.
+    
+    Handles training loop, validation, checkpointing, and logging
+    with comprehensive metrics tracking.
+    """
+    
+    def __init__(self, config: TrainingConfig):
+        """
+        Initialize trainer.
+        
+        Args:
+            config: Training configuration
+        """
+        self.config = config
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Create directories
+        Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        Path(config.log_dir).mkdir(parents=True, exist_ok=True)
+        
+        # Initialize model
+        self.model = AdvancedSRNetwork(config).to(self.device)
+        
+        # Initialize optimizer
+        self.optimizer = self._create_optimizer()
+        
+        # Initialize scheduler
+        self.scheduler = self._create_scheduler()
+        
+        # Initialize loss functions
+        self.criterion_pixel = nn.L1Loss() if config.loss_type == 'l1' else nn.MSELoss()
+        self.criterion_perceptual = PerceptualLoss() if config.perceptual_weight > 0 else None
+        
+        # Initialize metrics
+        self.metrics_calc = MetricsCalculator()
+        
+        # Training history
+        self.history = {
+            'train_loss': [],
+            'val_loss': [],
+            'val_psnr': [],
+            'val_ssim': [],
+            'learning_rates': []
+        }
+        
+        self.best_psnr = 0.0
+        self.current_epoch = 0
+    
+    def _create_optimizer(self) -> optim.Optimizer:
+        """Create optimizer based on config."""
+        if self.config.optimizer_type == 'adam':
+            return optim.Adam(self.model.parameters(), 
+                            lr=self.config.learning_rate,
+                            weight_decay=self.config.weight_decay)
+        elif self.config.optimizer_type == 'adamw':
+            return optim.AdamW(self.model.parameters(),
+                             lr=self.config.learning_rate,
+                             weight_decay=self.config.weight_decay)
+        elif self.config.optimizer_type == 'sgd':
+            return optim.SGD(self.model.parameters(),
+                           lr=self.config.learning_rate,
+                           momentum=0.9,
+                           weight_decay=self.config.weight_decay)
+        else:
+            raise ValueError(f"Unknown optimizer: {self.config.optimizer_type}")
+    
+    def _create_scheduler(self):
+        """Create learning rate scheduler."""
+        if self.config.scheduler_type == 'step':
+            return optim.lr_scheduler.StepLR(self.optimizer, 
+                                            step_size=30, gamma=0.5)
+        elif self.config.scheduler_type == 'cosine':
+            return optim.lr_scheduler.CosineAnnealingLR(self.optimizer,
+                                                       T_max=self.config.num_epochs)
+        elif self.config.scheduler_type == 'plateau':
+            return optim.lr_scheduler.ReduceLROnPlateau(self.optimizer,
+                                                       mode='max', patience=10)
+        else:
+            return None
+    
+    def train_epoch(self, train_loader: DataLoader) -> float:
+        """
+        Train for one epoch.
+        
+        Args:
+            train_loader: Training data loader
+            
+        Returns:
+            Average training loss
+        """
+        self.model.train()
+        total_loss = 0.0
+        num_batches = len(train_loader)
+        
+        progress_bar = tqdm(train_loader, desc=f"Epoch {self.current_epoch+1}")
+        
+        for lr_imgs, hr_imgs in progress_bar:
+            lr_imgs = lr_imgs.to(self.device)
+            hr_imgs = hr_imgs.to(self.device)
+            
+            # Forward pass
+            sr_imgs = self.model(lr_imgs)
+            
+            # Calculate losses
+            loss_pixel = self.criterion_pixel(sr_imgs, hr_imgs)
+            loss = loss_pixel
+            
+            # Add perceptual loss if enabled
+            if self.criterion_perceptual is not None:
+                loss_perceptual = self.criterion_perceptual(sr_imgs, hr_imgs)
+                loss += self.config.perceptual_weight * loss_perceptual
+            
+            # Backward pass
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            
+            total_loss += loss.item()
+            
+            # Update progress bar
+            progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
+        
+        avg_loss = total_loss / num_batches
+        return avg_loss
+    
+    def validate(self, val_loader: DataLoader) -> Dict[str, float]:
+        """
+        Validate the model.
+        
+        Args:
+            val_loader: Validation data loader
+            
+        Returns:
+            Dictionary of validation metrics
+        """
+        self.model.eval()
+        total_loss = 0.0
+        total_psnr = 0.0
+        total_ssim = 0.0
+        num_batches = len(val_loader)
+        
+        with torch.no_grad():
+            for lr_imgs, hr_imgs in val_loader:
+                lr_imgs = lr_imgs.to(self.device)
+                hr_imgs = hr_imgs.to(self.device)
+                
+                # Forward pass
+                sr_imgs = self.model(lr_imgs)
+                
+                # Calculate loss
+                loss = self.criterion_pixel(sr_imgs, hr_imgs)
+                total_loss += loss.item()
+                
+                # Calculate metrics
+                psnr = self.metrics_calc.calculate_psnr(sr_imgs, hr_imgs)
+                ssim = self.metrics_calc.calculate_ssim(sr_imgs, hr_imgs)
+                
+                total_psnr += psnr
+                total_ssim += ssim
+        
+        metrics = {
+            'val_loss': total_loss / num_batches,
+            'val_psnr': total_psnr / num_batches,
+            'val_ssim': total_ssim / num_batches
+        }
+        
+        return metrics
+    
+    def save_checkpoint(self, metrics: Dict[str, float], is_best: bool = False):
+        """
+        Save model checkpoint.
+        
+        Args:
+            metrics: Current metrics
+            is_best: Whether this is the best model so far
+        """
+        checkpoint = {
+            'epoch': self.current_epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+            'metrics': metrics,
+            'config': self.config.to_dict(),
+            'history': self.history
+        }
+        
+        # Save regular checkpoint
+        checkpoint_path = os.path.join(self.config.checkpoint_dir, 
+                                      f'checkpoint_epoch_{self.current_epoch}.pth')
+        torch.save(checkpoint, checkpoint_path)
+        
+        # Save best model
+        if is_best:
+            best_path = os.path.join(self.config.checkpoint_dir, 'best_model.pth')
+            torch.save(checkpoint, best_path)
+            print(f"  → Best model saved with PSNR: {metrics['val_psnr']:.2f} dB")
+    
+    def train(self, train_loader: DataLoader, val_loader: DataLoader):
+        """
+        Complete training loop.
+        
+        Args:
+            train_loader: Training data loader
+            val_loader: Validation data loader
+        """
+        print(f"\n{'='*70}")
+        print(f"Starting Training on {self.device}")
+        print(f"{'='*70}")
+        print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        print(f"Training samples: {len(train_loader.dataset)}")
+        print(f"Validation samples: {len(val_loader.dataset)}")
+        print(f"{'='*70}\n")
+        
+        start_time = time.time()
+        
+        for epoch in range(self.config.num_epochs):
+            self.current_epoch = epoch
+            
+            # Train
+            train_loss = self.train_epoch(train_loader)
+            
+            # Validate
+            val_metrics = self.validate(val_loader)
+            
+            # Update learning rate
+            if self.scheduler is not None:
+                if isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                    self.scheduler.step(val_metrics['val_psnr'])
+                else:
+                    self.scheduler.step()
+            
+            # Record history
+            current_lr = self.optimizer.param_groups[0]['lr']
+            self.history['train_loss'].append(train_loss)
+            self.history['val_loss'].append(val_metrics['val_loss'])
+            self.history['val_psnr'].append(val_metrics['val_psnr'])
+            self.history['val_ssim'].append(val_metrics['val_ssim'])
+            self.history['learning_rates'].append(current_lr)
+            
+            # Check if best model
+            is_best = val_metrics['val_psnr'] > self.best_psnr
+            if is_best:
+                self.best_psnr = val_metrics['val_psnr']
+            
+            # Print epoch summary
+            print(f"\nEpoch {epoch+1}/{self.config.num_epochs} Summary:")
+            print(f"  Train Loss: {train_loss:.4f}")
+            print(f"  Val Loss: {val_metrics['val_loss']:.4f}")
+            print(f"  Val PSNR: {val_metrics['val_psnr']:.2f} dB")
+            print(f"  Val SSIM: {val_metrics['val_ssim']:.4f}")
+            print(f"  Learning Rate: {current_lr:.2e}")
+            
+            # Save checkpoint
+            if (epoch + 1) % 10 == 0 or is_best:
+                self.save_checkpoint(val_metrics, is_best)
+        
+        elapsed_time = time.time() - start_time
+        print(f"\n{'='*70}")
+        print(f"Training completed in {elapsed_time/3600:.2f} hours")
+        print(f"Best PSNR: {self.best_psnr:.2f} dB")
+        print(f"{'='*70}\n")
+        
+        # Save training history
+        self.save_training_plots()
+    
+    def save_training_plots(self):
+        """Generate and save training visualization plots."""
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        
+        epochs = range(1, len(self.history['train_loss']) + 1)
+        
+        # Loss curves
+        axes[0, 0].plot(epochs, self.history['train_loss'], 'b-', label='Train Loss', linewidth=2)
+        axes[0, 0].plot(epochs, self.history['val_loss'], 'r-', label='Val Loss', linewidth=2)
+        axes[0, 0].set_xlabel('Epoch', fontsize=11)
+        axes[0, 0].set_ylabel('Loss', fontsize=11)
+        axes[0, 0].set_title('Training and Validation Loss', fontsize=12, fontweight='bold')
+        axes[0, 0].legend()
+        axes[0, 0].grid(alpha=0.3)
+        
+        # PSNR curve
+        axes[0, 1].plot(epochs, self.history['val_psnr'], 'g-', linewidth=2)
+        axes[0, 1].set_xlabel('Epoch', fontsize=11)
+        axes[0, 1].set_ylabel('PSNR (dB)', fontsize=11)
+        axes[0, 1].set_title('Validation PSNR', fontsize=12, fontweight='bold')
+        axes[0, 1].grid(alpha=0.3)
+        
+        # SSIM curve
+        axes[1, 0].plot(epochs, self.history['val_ssim'], 'm-', linewidth=2)
+        axes[1, 0].set_xlabel('Epoch', fontsize=11)
+        axes[1, 0].set_ylabel('SSIM', fontsize=11)
+        axes[1, 0].set_title('Validation SSIM', fontsize=12, fontweight='bold')
+        axes[1, 0].grid(alpha=0.3)
+        
+        # Learning rate curve
+        axes[1, 1].plot(epochs, self.history['learning_rates'], 'c-', linewidth=2)
+        axes[1, 1].set_xlabel('Epoch', fontsize=11)
+        axes[1, 1].set_ylabel('Learning Rate', fontsize=11)
+        axes[1, 1].set_title('Learning Rate Schedule', fontsize=12, fontweight='bold')
+        axes[1, 1].set_yscale('log')
+        axes[1, 1].grid(alpha=0.3)
+        
+        plt.tight_layout()
+        save_path = os.path.join(self.config.log_dir, 'training_curves.png')
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Training plots saved to: {save_path}")
+        plt.close()
+
+
+def demo_training_pipeline():
+    """
+    Demonstration of the complete training pipeline.
+    """
+    print("="*70)
+    print("Super-Resolution Network Training Module Demo")
+    print("="*70)
+    
+    # Configuration
+    config = TrainingConfig(
+        scale_factor=2,
+        num_features=64,
+        num_blocks=8,
+        batch_size=8,
+        num_epochs=20,
+        learning_rate=1e-4,
+        patch_size=48
+    )
+    
+    # Create datasets
+    print("\n[1/4] Creating datasets...")
+    train_dataset = SyntheticSRDataset(num_samples=200, hr_size=96, scale_factor=2)
+    val_dataset = SyntheticSRDataset(num_samples=50, hr_size=96, scale_factor=2, augmentation=False)
+    
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, 
+                             shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, 
+                           shuffle=False, num_workers=0)
+    
+    print(f"Training samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
+    
+    # Initialize trainer
+    print("\n[2/4] Initializing trainer...")
+    trainer = SRTrainer(config)
+    
+    # Train model
+    print("\n[3/4] Starting training...")
+    trainer.train(train_loader, val_loader)
+    
+    # Save final model info
+    print("\n[4/4] Saving final results...")
+    with open(os.path.join(config.log_dir, 'training_config.json'), 'w') as f:
+        json.dump(config.to_dict(), f, indent=4)
+    
+    print("\nDemo completed successfully!")
+    print(f"Results saved to: {config.log_dir}")
+
+
+if __name__ == "__main__":
+    demo_training_pipeline()
