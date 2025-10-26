@@ -1,0 +1,821 @@
+"""
+Interpretability Analysis and Comparison Module for Super-Resolution Networks
+
+This module provides comprehensive interpretability analysis tools including:
+- Multiple attribution methods comparison
+- Saliency mapping techniques
+- Feature visualization
+- Attention analysis
+- Quantitative interpretability metrics
+
+Author: jerrychen
+Date: 2025
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+import cv2
+from typing import Tuple, List, Dict, Optional, Union, Callable
+import os
+from pathlib import Path
+from scipy.ndimage import gaussian_filter, zoom
+from scipy.stats import pearsonr, spearmanr
+import seaborn as sns
+from matplotlib.gridspec import GridSpec
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import warnings
+warnings.filterwarnings('ignore')
+
+
+class GradCAM:
+    """
+    Gradient-weighted Class Activation Mapping for SR networks.
+    
+    Implements Grad-CAM to visualize which spatial regions are important
+    for the network's predictions in super-resolution tasks.
+    """
+    
+    def __init__(self, model: nn.Module, target_layer: str):
+        """
+        Initialize Grad-CAM.
+        
+        Args:
+            model: The neural network model
+            target_layer: Name of the layer to compute Grad-CAM for
+        """
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+        self.activations = None
+        
+        self._register_hooks()
+    
+    def _register_hooks(self):
+        """Register forward and backward hooks."""
+        def forward_hook(module, input, output):
+            self.activations = output.detach()
+        
+        def backward_hook(module, grad_input, grad_output):
+            self.gradients = grad_output[0].detach()
+        
+        # Find and register hooks on target layer
+        for name, module in self.model.named_modules():
+            if name == self.target_layer:
+                module.register_forward_hook(forward_hook)
+                module.register_full_backward_hook(backward_hook)
+                break
+    
+    def generate_cam(self, 
+                     input_tensor: torch.Tensor,
+                     target_position: Optional[Tuple[int, int]] = None) -> np.ndarray:
+        """
+        Generate Grad-CAM heatmap.
+        
+        Args:
+            input_tensor: Input image tensor
+            target_position: Target position in output to analyze
+            
+        Returns:
+            CAM heatmap as numpy array
+        """
+        self.model.eval()
+        
+        # Forward pass
+        output = self.model(input_tensor)
+        
+        # Select target
+        if target_position is None:
+            target_position = (output.shape[2] // 2, output.shape[3] // 2)
+        
+        target = output[:, :, target_position[0], target_position[1]].sum()
+        
+        # Backward pass
+        self.model.zero_grad()
+        target.backward()
+        
+        # Compute CAM
+        weights = self.gradients.mean(dim=(2, 3), keepdim=True)
+        cam = (weights * self.activations).sum(dim=1, keepdim=True)
+        cam = F.relu(cam)
+        
+        # Normalize
+        cam = cam.squeeze().cpu().numpy()
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+        
+        return cam
+
+
+class SmoothGrad:
+    """
+    SmoothGrad: Reducing noise in gradient-based attribution.
+    
+    Averages gradients computed at multiple noisy versions of the input
+    to produce smoother and more interpretable attribution maps.
+    """
+    
+    def __init__(self, model: nn.Module, num_samples: int = 50, noise_level: float = 0.1):
+        """
+        Initialize SmoothGrad.
+        
+        Args:
+            model: The neural network model
+            num_samples: Number of noisy samples to average
+            noise_level: Standard deviation of Gaussian noise
+        """
+        self.model = model
+        self.num_samples = num_samples
+        self.noise_level = noise_level
+    
+    def generate_smoothgrad(self,
+                           input_tensor: torch.Tensor,
+                           target_position: Optional[Tuple[int, int]] = None) -> np.ndarray:
+        """
+        Generate SmoothGrad attribution map.
+        
+        Args:
+            input_tensor: Input image tensor
+            target_position: Target position in output
+            
+        Returns:
+            SmoothGrad attribution map
+        """
+        self.model.eval()
+        accumulated_gradients = torch.zeros_like(input_tensor)
+        
+        for _ in range(self.num_samples):
+            # Add noise
+            noise = torch.randn_like(input_tensor) * self.noise_level
+            noisy_input = input_tensor + noise
+            noisy_input.requires_grad = True
+            
+            # Forward pass
+            output = self.model(noisy_input)
+            
+            # Select target
+            if target_position is None:
+                target_position = (output.shape[2] // 2, output.shape[3] // 2)
+            
+            target = output[:, :, target_position[0], target_position[1]].sum()
+            
+            # Backward pass
+            self.model.zero_grad()
+            target.backward()
+            
+            # Accumulate gradients
+            accumulated_gradients += noisy_input.grad.detach()
+        
+        # Average gradients
+        smooth_gradients = accumulated_gradients / self.num_samples
+        attribution = smooth_gradients.abs().mean(dim=1).squeeze().cpu().numpy()
+        
+        return attribution
+
+
+class DeepLIFT:
+    """
+    DeepLIFT: Deep Learning Important FeaTures.
+    
+    Compares neuron activations to reference activations to assign
+    importance scores, capturing both positive and negative contributions.
+    """
+    
+    def __init__(self, model: nn.Module, baseline_type: str = 'black'):
+        """
+        Initialize DeepLIFT.
+        
+        Args:
+            model: The neural network model
+            baseline_type: Type of baseline ('black', 'white', 'blur')
+        """
+        self.model = model
+        self.baseline_type = baseline_type
+    
+    def _create_baseline(self, input_tensor: torch.Tensor) -> torch.Tensor:
+        """Create baseline input based on type."""
+        if self.baseline_type == 'black':
+            return torch.zeros_like(input_tensor)
+        elif self.baseline_type == 'white':
+            return torch.ones_like(input_tensor)
+        elif self.baseline_type == 'blur':
+            # Apply heavy Gaussian blur
+            baseline = input_tensor.clone()
+            for i in range(baseline.shape[1]):
+                img = baseline[0, i].cpu().numpy()
+                blurred = gaussian_filter(img, sigma=10)
+                baseline[0, i] = torch.from_numpy(blurred).to(input_tensor.device)
+            return baseline
+        else:
+            return torch.zeros_like(input_tensor)
+    
+    def generate_deeplift(self,
+                         input_tensor: torch.Tensor,
+                         target_position: Optional[Tuple[int, int]] = None,
+                         num_steps: int = 50) -> np.ndarray:
+        """
+        Generate DeepLIFT attribution map.
+        
+        Args:
+            input_tensor: Input image tensor
+            target_position: Target position in output
+            num_steps: Number of interpolation steps
+            
+        Returns:
+            DeepLIFT attribution map
+        """
+        self.model.eval()
+        
+        # Create baseline
+        baseline = self._create_baseline(input_tensor)
+        
+        # Interpolate between baseline and input
+        alphas = torch.linspace(0, 1, num_steps).to(input_tensor.device)
+        
+        accumulated_gradients = torch.zeros_like(input_tensor)
+        
+        for alpha in alphas:
+            interpolated = baseline + alpha * (input_tensor - baseline)
+            interpolated.requires_grad = True
+            
+            # Forward pass
+            output = self.model(interpolated)
+            
+            # Select target
+            if target_position is None:
+                target_position = (output.shape[2] // 2, output.shape[3] // 2)
+            
+            target = output[:, :, target_position[0], target_position[1]].sum()
+            
+            # Backward pass
+            self.model.zero_grad()
+            target.backward()
+            
+            # Accumulate
+            accumulated_gradients += interpolated.grad.detach()
+        
+        # Average and multiply by input difference
+        avg_gradients = accumulated_gradients / num_steps
+        attribution = (input_tensor - baseline) * avg_gradients
+        attribution_map = attribution.abs().mean(dim=1).squeeze().cpu().numpy()
+        
+        return attribution_map
+
+
+class FeatureVisualizer:
+    """
+    Feature Visualization for Super-Resolution Networks.
+    
+    Visualizes learned features at different layers of the network
+    to understand what patterns the network has learned.
+    """
+    
+    def __init__(self, model: nn.Module):
+        """
+        Initialize feature visualizer.
+        
+        Args:
+            model: The neural network model
+        """
+        self.model = model
+        self.features = {}
+        self._register_hooks()
+    
+    def _register_hooks(self):
+        """Register hooks to capture intermediate features."""
+        def get_features(name):
+            def hook(module, input, output):
+                self.features[name] = output.detach()
+            return hook
+        
+        # Register hooks on convolutional layers
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Conv2d):
+                module.register_forward_hook(get_features(name))
+    
+    def extract_features(self, input_tensor: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Extract features from all layers.
+        
+        Args:
+            input_tensor: Input image tensor
+            
+        Returns:
+            Dictionary of features by layer name
+        """
+        self.model.eval()
+        self.features = {}
+        
+        with torch.no_grad():
+            _ = self.model(input_tensor)
+        
+        return self.features
+    
+    def visualize_feature_maps(self,
+                              features_dict: Dict[str, torch.Tensor],
+                              max_channels: int = 16,
+                              save_path: Optional[str] = None):
+        """
+        Visualize feature maps from multiple layers.
+        
+        Args:
+            features_dict: Dictionary of features
+            max_channels: Maximum number of channels to display per layer
+            save_path: Path to save visualization
+        """
+        num_layers = len(features_dict)
+        fig = plt.figure(figsize=(20, 4 * num_layers))
+        gs = GridSpec(num_layers, max_channels, figure=fig)
+        
+        for layer_idx, (layer_name, features) in enumerate(features_dict.items()):
+            num_channels = min(features.shape[1], max_channels)
+            
+            for ch_idx in range(num_channels):
+                ax = fig.add_subplot(gs[layer_idx, ch_idx])
+                feature_map = features[0, ch_idx].cpu().numpy()
+                
+                # Normalize
+                feature_map = (feature_map - feature_map.min()) / (feature_map.max() - feature_map.min() + 1e-8)
+                
+                ax.imshow(feature_map, cmap='viridis')
+                ax.axis('off')
+                
+                if ch_idx == 0:
+                    ax.set_ylabel(f'{layer_name}', fontsize=10, rotation=0, ha='right', va='center')
+                if layer_idx == 0:
+                    ax.set_title(f'Ch {ch_idx}', fontsize=9)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Feature maps saved to: {save_path}")
+        
+        plt.show()
+
+
+class InterpretabilityComparator:
+    """
+    Comprehensive Interpretability Comparison Framework.
+    
+    Compares multiple interpretability methods quantitatively and qualitatively
+    to understand their strengths, weaknesses, and agreements.
+    """
+    
+    def __init__(self, model: nn.Module, device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
+        """
+        Initialize comparator.
+        
+        Args:
+            model: The neural network model
+            device: Computing device
+        """
+        self.model = model.to(device)
+        self.device = device
+        
+        # Initialize different attribution methods
+        self.methods = {
+            'vanilla_gradient': self._vanilla_gradient,
+            'smoothgrad': SmoothGrad(model, num_samples=30).generate_smoothgrad,
+            'deeplift': DeepLIFT(model, baseline_type='black').generate_deeplift,
+            'deeplift_blur': DeepLIFT(model, baseline_type='blur').generate_deeplift,
+        }
+        
+        # Try to find a suitable layer for GradCAM
+        try:
+            target_layer = self._find_target_layer()
+            self.methods['gradcam'] = GradCAM(model, target_layer).generate_cam
+        except:
+            print("Warning: Could not initialize GradCAM")
+    
+    def _find_target_layer(self) -> str:
+        """Find a suitable convolutional layer for GradCAM."""
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Conv2d) and 'conv_fusion' in name:
+                return name
+        # Fallback: find last conv layer
+        conv_layers = [(name, module) for name, module in self.model.named_modules() 
+                      if isinstance(module, nn.Conv2d)]
+        if conv_layers:
+            return conv_layers[-2][0]  # Use second-to-last conv layer
+        return None
+    
+    def _vanilla_gradient(self, input_tensor: torch.Tensor, 
+                         target_position: Optional[Tuple[int, int]] = None) -> np.ndarray:
+        """Compute vanilla gradient attribution."""
+        input_tensor = input_tensor.requires_grad_(True)
+        
+        output = self.model(input_tensor)
+        
+        if target_position is None:
+            target_position = (output.shape[2] // 2, output.shape[3] // 2)
+        
+        target = output[:, :, target_position[0], target_position[1]].sum()
+        
+        self.model.zero_grad()
+        target.backward()
+        
+        gradients = input_tensor.grad.abs().mean(dim=1).squeeze().cpu().numpy()
+        return gradients
+    
+    def compare_methods(self,
+                       input_tensor: torch.Tensor,
+                       target_position: Optional[Tuple[int, int]] = None) -> Dict[str, np.ndarray]:
+        """
+        Compare all attribution methods on the same input.
+        
+        Args:
+            input_tensor: Input image tensor
+            target_position: Target position to analyze
+            
+        Returns:
+            Dictionary of attribution maps from each method
+        """
+        attributions = {}
+        
+        print("Generating attributions using different methods...")
+        for method_name, method_func in self.methods.items():
+            print(f"  - {method_name}")
+            try:
+                attribution = method_func(input_tensor, target_position)
+                attributions[method_name] = attribution
+            except Exception as e:
+                print(f"    Warning: Failed to generate {method_name}: {str(e)}")
+        
+        return attributions
+    
+    def compute_agreement_metrics(self, 
+                                 attributions: Dict[str, np.ndarray]) -> Dict[str, float]:
+        """
+        Compute agreement metrics between attribution methods.
+        
+        Args:
+            attributions: Dictionary of attribution maps
+            
+        Returns:
+            Dictionary of agreement metrics
+        """
+        methods = list(attributions.keys())
+        n_methods = len(methods)
+        
+        # Compute pairwise correlations
+        correlations = {}
+        for i in range(n_methods):
+            for j in range(i+1, n_methods):
+                attr1 = attributions[methods[i]].flatten()
+                attr2 = attributions[methods[j]].flatten()
+                
+                # Pearson correlation
+                pearson_corr, _ = pearsonr(attr1, attr2)
+                
+                # Spearman correlation
+                spearman_corr, _ = spearmanr(attr1, attr2)
+                
+                key = f"{methods[i]}_vs_{methods[j]}"
+                correlations[key] = {
+                    'pearson': pearson_corr,
+                    'spearman': spearman_corr
+                }
+        
+        # Compute average correlations
+        all_pearson = [v['pearson'] for v in correlations.values()]
+        all_spearman = [v['spearman'] for v in correlations.values()]
+        
+        agreement_metrics = {
+            'pairwise_correlations': correlations,
+            'avg_pearson': np.mean(all_pearson),
+            'avg_spearman': np.mean(all_spearman),
+            'std_pearson': np.std(all_pearson),
+            'std_spearman': np.std(all_spearman)
+        }
+        
+        return agreement_metrics
+    
+    def compute_sensitivity_metrics(self,
+                                   attributions: Dict[str, np.ndarray]) -> Dict[str, Dict]:
+        """
+        Compute sensitivity and sparsity metrics for each method.
+        
+        Args:
+            attributions: Dictionary of attribution maps
+            
+        Returns:
+            Dictionary of sensitivity metrics per method
+        """
+        metrics = {}
+        
+        for method_name, attr in attributions.items():
+            # Normalize attribution
+            attr_norm = (attr - attr.min()) / (attr.max() - attr.min() + 1e-8)
+            
+            # Compute metrics
+            metrics[method_name] = {
+                'mean': float(attr.mean()),
+                'std': float(attr.std()),
+                'max': float(attr.max()),
+                'sparsity_50': float(np.mean(attr_norm > 0.5)),  # % above 50% threshold
+                'sparsity_75': float(np.mean(attr_norm > 0.75)),  # % above 75% threshold
+                'concentration': float(np.sum(attr_norm > 0.9) / attr.size),  # Top 10% concentration
+                'entropy': float(-np.sum(attr_norm * np.log(attr_norm + 1e-10)))  # Entropy
+            }
+        
+        return metrics
+    
+    def visualize_comparison(self,
+                           input_image: np.ndarray,
+                           attributions: Dict[str, np.ndarray],
+                           save_path: Optional[str] = None):
+        """
+        Create comprehensive visualization comparing all methods.
+        
+        Args:
+            input_image: Original input image
+            attributions: Dictionary of attribution maps
+            save_path: Path to save visualization
+        """
+        n_methods = len(attributions)
+        fig, axes = plt.subplots(2, n_methods + 1, figsize=(5 * (n_methods + 1), 10))
+        
+        # Ensure input_image is in correct format
+        if input_image.max() <= 1.0:
+            input_image = (input_image * 255).astype(np.uint8)
+        
+        # Plot input image
+        axes[0, 0].imshow(input_image)
+        axes[0, 0].set_title('Input Image', fontsize=12, fontweight='bold')
+        axes[0, 0].axis('off')
+        
+        axes[1, 0].imshow(input_image)
+        axes[1, 0].set_title('Input Image', fontsize=12, fontweight='bold')
+        axes[1, 0].axis('off')
+        
+        # Plot each method
+        for idx, (method_name, attr) in enumerate(attributions.items(), 1):
+            # Normalize
+            attr_norm = (attr - attr.min()) / (attr.max() - attr.min() + 1e-8)
+            
+            # Resize if needed
+            if attr.shape != input_image.shape[:2]:
+                attr_norm = cv2.resize(attr_norm, (input_image.shape[1], input_image.shape[0]))
+            
+            # Plot heatmap
+            im = axes[0, idx].imshow(attr_norm, cmap='jet')
+            axes[0, idx].set_title(f'{method_name}\n(Heatmap)', fontsize=11, fontweight='bold')
+            axes[0, idx].axis('off')
+            plt.colorbar(im, ax=axes[0, idx], fraction=0.046)
+            
+            # Plot overlay
+            heatmap = plt.cm.jet(attr_norm)[:, :, :3] * 255
+            overlay = cv2.addWeighted(input_image.astype(np.uint8), 0.5, 
+                                     heatmap.astype(np.uint8), 0.5, 0)
+            axes[1, idx].imshow(overlay)
+            axes[1, idx].set_title(f'{method_name}\n(Overlay)', fontsize=11, fontweight='bold')
+            axes[1, idx].axis('off')
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Comparison visualization saved to: {save_path}")
+        
+        plt.show()
+    
+    def plot_agreement_analysis(self,
+                               agreement_metrics: Dict,
+                               save_path: Optional[str] = None):
+        """
+        Visualize agreement metrics between methods.
+        
+        Args:
+            agreement_metrics: Agreement metrics dictionary
+            save_path: Path to save plot
+        """
+        pairwise_corr = agreement_metrics['pairwise_correlations']
+        
+        # Extract method names
+        pairs = list(pairwise_corr.keys())
+        pearson_vals = [v['pearson'] for v in pairwise_corr.values()]
+        spearman_vals = [v['spearman'] for v in pairwise_corr.values()]
+        
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+        
+        # Pearson correlations
+        axes[0].barh(pairs, pearson_vals, color='steelblue', alpha=0.7)
+        axes[0].set_xlabel('Pearson Correlation', fontsize=12)
+        axes[0].set_title('Inter-Method Agreement (Pearson)', fontsize=13, fontweight='bold')
+        axes[0].axvline(x=agreement_metrics['avg_pearson'], color='red', 
+                       linestyle='--', label=f"Mean: {agreement_metrics['avg_pearson']:.3f}")
+        axes[0].legend()
+        axes[0].grid(axis='x', alpha=0.3)
+        
+        # Spearman correlations
+        axes[1].barh(pairs, spearman_vals, color='coral', alpha=0.7)
+        axes[1].set_xlabel('Spearman Correlation', fontsize=12)
+        axes[1].set_title('Inter-Method Agreement (Spearman)', fontsize=13, fontweight='bold')
+        axes[1].axvline(x=agreement_metrics['avg_spearman'], color='red',
+                       linestyle='--', label=f"Mean: {agreement_metrics['avg_spearman']:.3f}")
+        axes[1].legend()
+        axes[1].grid(axis='x', alpha=0.3)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Agreement analysis saved to: {save_path}")
+        
+        plt.show()
+    
+    def plot_sensitivity_analysis(self,
+                                 sensitivity_metrics: Dict,
+                                 save_path: Optional[str] = None):
+        """
+        Visualize sensitivity and sparsity metrics.
+        
+        Args:
+            sensitivity_metrics: Sensitivity metrics dictionary
+            save_path: Path to save plot
+        """
+        methods = list(sensitivity_metrics.keys())
+        
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        
+        # Mean attribution
+        means = [sensitivity_metrics[m]['mean'] for m in methods]
+        axes[0, 0].bar(methods, means, color='skyblue', alpha=0.7)
+        axes[0, 0].set_ylabel('Mean Attribution', fontsize=11)
+        axes[0, 0].set_title('Average Attribution Value', fontsize=12, fontweight='bold')
+        axes[0, 0].tick_params(axis='x', rotation=45)
+        axes[0, 0].grid(axis='y', alpha=0.3)
+        
+        # Standard deviation
+        stds = [sensitivity_metrics[m]['std'] for m in methods]
+        axes[0, 1].bar(methods, stds, color='lightcoral', alpha=0.7)
+        axes[0, 1].set_ylabel('Std Attribution', fontsize=11)
+        axes[0, 1].set_title('Attribution Variability', fontsize=12, fontweight='bold')
+        axes[0, 1].tick_params(axis='x', rotation=45)
+        axes[0, 1].grid(axis='y', alpha=0.3)
+        
+        # Sparsity comparison
+        sparsity_50 = [sensitivity_metrics[m]['sparsity_50'] for m in methods]
+        sparsity_75 = [sensitivity_metrics[m]['sparsity_75'] for m in methods]
+        x = np.arange(len(methods))
+        width = 0.35
+        axes[0, 2].bar(x - width/2, sparsity_50, width, label='50% threshold', alpha=0.7)
+        axes[0, 2].bar(x + width/2, sparsity_75, width, label='75% threshold', alpha=0.7)
+        axes[0, 2].set_ylabel('Proportion', fontsize=11)
+        axes[0, 2].set_title('Sparsity Analysis', fontsize=12, fontweight='bold')
+        axes[0, 2].set_xticks(x)
+        axes[0, 2].set_xticklabels(methods, rotation=45)
+        axes[0, 2].legend()
+        axes[0, 2].grid(axis='y', alpha=0.3)
+        
+        # Concentration
+        concentrations = [sensitivity_metrics[m]['concentration'] for m in methods]
+        axes[1, 0].bar(methods, concentrations, color='lightgreen', alpha=0.7)
+        axes[1, 0].set_ylabel('Concentration', fontsize=11)
+        axes[1, 0].set_title('Top 10% Concentration', fontsize=12, fontweight='bold')
+        axes[1, 0].tick_params(axis='x', rotation=45)
+        axes[1, 0].grid(axis='y', alpha=0.3)
+        
+        # Entropy
+        entropies = [sensitivity_metrics[m]['entropy'] for m in methods]
+        axes[1, 1].bar(methods, entropies, color='plum', alpha=0.7)
+        axes[1, 1].set_ylabel('Entropy', fontsize=11)
+        axes[1, 1].set_title('Attribution Entropy', fontsize=12, fontweight='bold')
+        axes[1, 1].tick_params(axis='x', rotation=45)
+        axes[1, 1].grid(axis='y', alpha=0.3)
+        
+        # Summary radar chart
+        categories = ['Mean', 'Std', 'Sparse-50', 'Sparse-75', 'Concentrate']
+        angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
+        angles += angles[:1]
+        
+        ax_radar = plt.subplot(2, 3, 6, projection='polar')
+        
+        for method in methods:
+            values = [
+                sensitivity_metrics[method]['mean'] / max(means),
+                sensitivity_metrics[method]['std'] / max(stds),
+                sensitivity_metrics[method]['sparsity_50'],
+                sensitivity_metrics[method]['sparsity_75'],
+                sensitivity_metrics[method]['concentration'] / max(concentrations)
+            ]
+            values += values[:1]
+            ax_radar.plot(angles, values, 'o-', linewidth=2, label=method)
+            ax_radar.fill(angles, values, alpha=0.15)
+        
+        ax_radar.set_xticks(angles[:-1])
+        ax_radar.set_xticklabels(categories, fontsize=9)
+        ax_radar.set_ylim(0, 1)
+        ax_radar.set_title('Normalized Metrics Comparison', fontsize=12, fontweight='bold', pad=20)
+        ax_radar.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1), fontsize=8)
+        ax_radar.grid(True)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Sensitivity analysis saved to: {save_path}")
+        
+        plt.show()
+
+
+def demo_interpretability_comparison():
+    """
+    Demonstration of comprehensive interpretability analysis.
+    """
+    print("="*70)
+    print("Interpretability Analysis and Comparison Module Demo")
+    print("="*70)
+    
+    # Setup device
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"\nUsing device: {device}")
+    
+    # Import model from previous module
+    from sr_training_module import AdvancedSRNetwork, TrainingConfig
+    
+    # Create model
+    print("\n[1/6] Creating super-resolution network...")
+    config = TrainingConfig(scale_factor=2, num_features=64, num_blocks=6)
+    model = AdvancedSRNetwork(config)
+    model.to(device)
+    print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")
+    
+    # Create test input
+    print("\n[2/6] Generating test image...")
+    lr_size = 64
+    lr_image = torch.randn(1, 3, lr_size, lr_size).to(device)
+    lr_image = torch.sigmoid(lr_image)
+    
+    # Initialize comparator
+    print("\n[3/6] Initializing interpretability comparator...")
+    comparator = InterpretabilityComparator(model, device)
+    
+    # Generate attributions
+    print("\n[4/6] Comparing attribution methods...")
+    attributions = comparator.compare_methods(lr_image)
+    print(f"Generated {len(attributions)} attribution maps")
+    
+    # Compute agreement metrics
+    print("\n[5/6] Computing agreement metrics...")
+    agreement_metrics = comparator.compute_agreement_metrics(attributions)
+    print(f"Average Pearson correlation: {agreement_metrics['avg_pearson']:.3f}")
+    print(f"Average Spearman correlation: {agreement_metrics['avg_spearman']:.3f}")
+    
+    # Compute sensitivity metrics
+    print("\n[6/6] Computing sensitivity metrics...")
+    sensitivity_metrics = comparator.compute_sensitivity_metrics(attributions)
+    
+    # Create output directory
+    output_dir = Path('./interpretability_results')
+    output_dir.mkdir(exist_ok=True)
+    
+    # Visualize results
+    print("\nGenerating visualizations...")
+    
+    # Convert image for visualization
+    lr_np = lr_image.squeeze().permute(1, 2, 0).cpu().numpy()
+    
+    # Comparison visualization
+    comparator.visualize_comparison(
+        lr_np,
+        attributions,
+        save_path=str(output_dir / 'methods_comparison.png')
+    )
+    
+    # Agreement analysis
+    comparator.plot_agreement_analysis(
+        agreement_metrics,
+        save_path=str(output_dir / 'agreement_analysis.png')
+    )
+    
+    # Sensitivity analysis
+    comparator.plot_sensitivity_analysis(
+        sensitivity_metrics,
+        save_path=str(output_dir / 'sensitivity_analysis.png')
+    )
+    
+    # Feature visualization
+    print("\nGenerating feature visualizations...")
+    feature_visualizer = FeatureVisualizer(model)
+    features = feature_visualizer.extract_features(lr_image)
+    
+    # Select some layers to visualize
+    selected_features = {k: v for k, v in list(features.items())[:3]}
+    feature_visualizer.visualize_feature_maps(
+        selected_features,
+        max_channels=8,
+        save_path=str(output_dir / 'feature_maps.png')
+    )
+    
+    print("\n" + "="*70)
+    print("Demo completed successfully!")
+    print(f"Results saved to: {output_dir}")
+    print("="*70)
+
+
+if __name__ == "__main__":
+    demo_interpretability_comparison()
